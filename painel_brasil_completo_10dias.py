@@ -6,6 +6,7 @@ from dash import Dash, dcc, html, Input, Output, State, callback, no_update
 import plotly.express as px
 import math
 from datetime import date
+import os  # <-- NOVO (Render/PORT)
 
 # ----- Limites do Brasil (aprox.) + limites de zoom -----
 BRAZIL_BBOX = {"west": -74.5, "east": -32.0, "south": -34.5, "north": 6.0}
@@ -13,22 +14,46 @@ CLAMP_ZOOM_MIN = 3.0
 CLAMP_ZOOM_MAX = 7.0
 
 # ================== CAMINHOS ==================
-PASTA = Path(r"C:\Users\Pedro\Downloads")
-ARQ_PREV = PASTA / "previsao_brasil_10dias.xlsx"  # <-- ÚNICA MUDANÇA (antes: previsao_brasil_5dias.xlsx)
-ARQ_ATTR = PASTA / "arquivo_completo_brasil.xlsx"
-GEOJSON_MUN = Path(r"C:\Users\Pedro\Downloads\Shapes_mun\municipios_br.geojson")
+# Ajuste p/ rodar local (Windows) e também no Render (caminhos relativos ao repo)
+BASE_DIR = Path(__file__).resolve().parent
+PASTA_LOCAL = Path(r"C:\Users\Pedro\Downloads")
+
+def pick_first_existing(*candidates: Path) -> Path:
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            pass
+    return candidates[0]
+
+ARQ_PREV = pick_first_existing(
+    PASTA_LOCAL / "previsao_brasil_10dias.xlsx",
+    BASE_DIR / "previsao_brasil_10dias.xlsx",
+)
+
+ARQ_ATTR = pick_first_existing(
+    PASTA_LOCAL / "arquivo_completo_brasil.xlsx",
+    BASE_DIR / "arquivo_completo_brasil.xlsx",
+)
+
+# Aceita .geojson OU .json (desde que o conteúdo seja GeoJSON válido)
+GEOJSON_MUN = pick_first_existing(
+    Path(r"C:\Users\Pedro\Downloads\Shapes_mun\municipios_br.geojson"),
+    Path(r"C:\Users\Pedro\Downloads\Shapes_mun\municipios_br.json"),
+    BASE_DIR / "municipios_br.geojson",
+    BASE_DIR / "municipios_br.json",
+)
 
 # ================== PALETAS & ORDENS ==================
-# EHF: mantém as classes que você definiu
 CLASS_ORDER = ["Normal", "Baixo", "Severo", "Extremo"]
 COLOR_MAP   = {
-    "Normal": "#C5E0B4",  # rgb(197,224,180)
+    "Normal": "#C5E0B4",
     "Baixo":  "#F1C40F",
     "Severo": "#E67E22",
     "Extremo":"#C0392B"
 }
 
-# Risco combinado: mesmas cores do EHF
 RISK_ORDER  = ["Normal", "Baixo", "Severo", "Extremo"]
 RISK_COLORS = {
     "Normal": COLOR_MAP["Normal"],
@@ -135,12 +160,11 @@ def build_combined_risk(df: pd.DataFrame):
         return df, False
     d = df.copy()
     geoses_num = pd.to_numeric(d["GeoSES"], errors="coerce")
-    d["V"] = ((1 - geoses_num) / 2).clip(0, 1)  # vulnerabilidade social (0=baixa,1=alta)
+    d["V"] = ((1 - geoses_num) / 2).clip(0, 1)
     H = (d["EHF"].clip(lower=0)) / d.get("EHF99").replace(0, np.nan)
     d["H_norm"] = H.clip(0, 1).fillna(0)
     d["risk_index"] = 0.5*d["H_norm"] + 0.5*d["V"]
 
-    # 0–0.33 Baixo, 0.33–0.66 Severo, >0.66 Extremo
     d["risk_class"] = pd.cut(
         d["risk_index"].fillna(0),
         [-0.001, 0.33, 0.66, 1.0],
@@ -148,7 +172,6 @@ def build_combined_risk(df: pd.DataFrame):
         include_lowest=True
     ).astype(object)
 
-    # Se EHF está em "Normal", força risco combinado = "Normal"
     d.loc[d["classification"]=="Normal", "risk_class"] = "Normal"
     return d, d["V"].notna().any()
 
@@ -242,7 +265,6 @@ base = calc_ehf(base)
 base = classify_by_ratio(base)
 base, HAS_RISK = build_combined_risk(base)
 
-# Default Brasília para o gráfico (dropdown começa vazio)
 def busca_brasilia(df):
     c = df[(df["UF_KEY"]=="DF") & (df["NM_MUN"].str.upper().str.contains("BRASILIA|BRASÍLIA", na=False))]
     if not c.empty: return c.iloc[0]["CD_MUN"]
@@ -250,7 +272,6 @@ def busca_brasilia(df):
     return df["CD_MUN"].iloc[0]
 DEFAULT_MUN = busca_brasilia(base)
 
-# Opções dos filtros
 REG_OPTS = (base[["REG_KEY","NM_REGIAO"]].dropna().drop_duplicates()
             .sort_values("NM_REGIAO")
             .rename(columns={"REG_KEY":"value","NM_REGIAO":"label"})
@@ -272,15 +293,18 @@ def initial_date_index():
     return DATES.index(hoje) if hoje in DATES else 0
 
 # ================== APP ==================
-app = Dash(__name__)
+# Responsivo: viewport + meta_tags
+app = Dash(__name__, meta_tags=[{"name":"viewport","content":"width=device-width, initial-scale=1"}])
+server = app.server  # <-- necessário pro Render (gunicorn)
 app.title = "Fator de Excesso de Calor (EHF) – Brasil"
 
-# Camadas
 layer_opts = [{"label":"EHF", "value":"ehf"}]
 if HAS_RISK:
     layer_opts.append({"label":"Risco combinado (EHF + GeoSES)", "value":"risk"})
 
-app.layout = html.Div(style={"fontFamily":"Inter, system-ui, Arial","padding":"12px"}, children=[
+app.layout = html.Div(
+    style={"fontFamily":"Inter, system-ui, Arial","padding":"12px","maxWidth":"1400px","margin":"0 auto"},
+    children=[
     html.H3("Fator de Excesso de Calor (EHF) – Brasil"),
     html.Div([
         html.Div([
@@ -314,8 +338,8 @@ app.layout = html.Div(style={"fontFamily":"Inter, system-ui, Arial","padding":"1
         ], style={"minWidth":"260px","flex":"1"})
     ], style={"display":"flex","gap":"10px","alignItems":"center","marginBottom":"10px","flexWrap":"wrap"}),
 
+    # Responsivo real: quebra 3/2 em telas menores (flexWrap + minWidth)
     html.Div([
-        # ========== COL ESQUERDA: MAPA + CARDS ==========
         html.Div([
             dcc.Graph(
                 id="mapa",
@@ -323,7 +347,7 @@ app.layout = html.Div(style={"fontFamily":"Inter, system-ui, Arial","padding":"1
                 config={
                     "scrollZoom": True,
                     "displaylogo": False,
-                    # remove alguns botões que incentivam pan/zoom “fora”
+                    "responsive": True,  # <-- responsivo (Plotly)
                     "modeBarButtonsToRemove": ["pan2d","lasso2d","select2d","autoScale2d","toggleSpikelines"]
                 }
             ),
@@ -331,11 +355,9 @@ app.layout = html.Div(style={"fontFamily":"Inter, system-ui, Arial","padding":"1
                      style={"display":"grid","gridTemplateColumns":"repeat(4, 1fr)",
                             "gap":"8px","alignItems":"stretch","marginTop":"2px"}),
 
-            # ------ CONSULTA POR CLASSE (EHF & RISCO) ------
             html.Hr(),
             html.Div("Consulta por classificação (dia atual)", style={"fontWeight":"700","margin":"6px 0"}),
             html.Div([
-                # EHF
                 html.Div([
                     html.Div([
                         html.Label("Classificação (EHF)"),
@@ -358,7 +380,6 @@ app.layout = html.Div(style={"fontFamily":"Inter, system-ui, Arial","padding":"1
                     ], style={"marginTop":"6px","display":"flex","justifyContent":"flex-end"}),
                 ], style={"flex":"1","minWidth":"280px","marginRight":"8px"}),
 
-                # RISCO
                 html.Div([
                     html.Div([
                         html.Label("Risco combinado"),
@@ -382,14 +403,17 @@ app.layout = html.Div(style={"fontFamily":"Inter, system-ui, Arial","padding":"1
                     ], style={"marginTop":"6px","display":"flex","justifyContent":"flex-end"}),
                 ], style={"flex":"1","minWidth":"280px"})
             ], style={"display":"flex","gap":"8px","flexWrap":"wrap"})
-        ], style={"flex":"3","paddingRight":"8px"}),
+        ], style={"flex":"3","minWidth":"320px","paddingRight":"8px"}),
 
-        # ========== COL DIREITA: GRÁFICO + EHF POR DIA ==========
         html.Div([
-            dcc.Graph(id="serie-municipio", style={"height":"50vh","marginBottom":"10px"}),
+            dcc.Graph(
+                id="serie-municipio",
+                style={"height":"50vh","marginBottom":"10px"},
+                config={"responsive": True, "displaylogo": False}
+            ),
             html.Div(id="ehf-dia", style={"display":"grid","gridTemplateColumns":"repeat(5, 1fr)","gap":"6px"})
-        ], style={"flex":"2","paddingLeft":"8px"})
-    ], style={"display":"flex","gap":"8px"})
+        ], style={"flex":"2","minWidth":"320px","paddingLeft":"8px"})
+    ], style={"display":"flex","gap":"8px","flexWrap":"wrap"})
 ])
 
 # ================== CALLBACKS ==================
@@ -451,7 +475,7 @@ def cb_munis(reg_key, uf_keys, clickData, mval):
     Input("uf-filter","value"),
     Input("muni-filter","value"),
     Input("layer","value"),
-    Input("mapa","relayoutData"),  # <- NOVO: monitorar interações do usuário
+    Input("mapa","relayoutData"),
 )
 def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
     if not DATES:
@@ -459,7 +483,6 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
     dia = DATES[idx_date] if 0 <= idx_date < len(DATES) else DATES[-1]
     uf_keys = uf_keys or []
 
-    # ====== MAPA ======
     df = base[base["data"].dt.date == dia].copy()
     if reg_key:
         df = df[df["REG_KEY"] == reg_key]
@@ -496,8 +519,8 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
         custom_data=["EHF","GeoSES","risk_index"],
         category_orders={color_col: ordem},
         mapbox_style="carto-positron",
-        center={"lat": -14.2, "lon": -51.9},  # centro inicial Brasil
-        zoom=3.4,                              # zoom inicial Brasil
+        center={"lat": -14.2, "lon": -51.9},
+        zoom=3.4,
         opacity=0.85
     )
     fig_map.update_traces(
@@ -509,7 +532,6 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
     )
     fig_map.update_layout(clickmode="event+select")
 
-    # Auto-zoom quando aplicar filtro geográfico (clamp ao Brasil)
     apply_zoom = bool(reg_key) or bool(uf_keys) or bool(muni_key)
     bbox = None
     if apply_zoom and not vis.empty:
@@ -522,7 +544,6 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
             lon = min(max(center["lon"], BRAZIL_BBOX["west"]),  BRAZIL_BBOX["east"])
             fig_map.update_layout(mapbox_center={"lat": lat, "lon": lon}, mapbox_zoom=z)
 
-    # Clamp após interações do usuário (relayoutData)
     if isinstance(relayout, dict):
         c = relayout.get("mapbox.center") or relayout.get("mapbox._center")
         z = relayout.get("mapbox.zoom")
@@ -544,7 +565,6 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
                           legend_title_text=legend_title,
                           uirevision=f"reg:{reg_key}|ufs:{','.join(uf_keys)}|mun:{muni_key or ''}")
 
-    # ====== BARRAS MUNICÍPIO ======
     muni_sel = muni_key if muni_key else DEFAULT_MUN
     dmun = base[base["CD_MUN"] == muni_sel].copy()
     if "Tmean" not in dmun or dmun["Tmean"].dropna().empty:
@@ -588,7 +608,6 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
         paper_bgcolor="white"
     )
 
-    # ====== CARDS ======
     cont = df[color_col].value_counts().reindex(ordem, fill_value=0)
     cards = []
     for lbl in ordem:
@@ -605,7 +624,6 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
             })
         )
 
-    # ====== EHF POR DIA (município) ======
     ehf_boxes = []
     if not serie.empty:
         for dstr, cl in zip(serie["data_lbl"], serie["classification"]):
@@ -620,7 +638,6 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
 
     return fig_map, fig_bar, cards, ehf_boxes
 
-# ===== CONSULTA POR CLASSE (listas) =====
 @callback(
     Output("ehf-cls-count","children"),
     Output("ehf-cls-list","children"),
@@ -645,14 +662,12 @@ def cb_listas(idx_date, reg_key, uf_keys, ehf_cls, risk_cls):
     if uf_keys:
         df = df[df["UF_KEY"].isin(uf_keys)]
 
-    # ----- EHF -----
     d_ehf = df[df["classification"] == ehf_cls].sort_values(["SIGLA_UF","NM_MUN"])
     c_ehf = len(d_ehf["CD_MUN"].unique())
     list_ehf = ([html.Div(f"{r.NM_MUN} / {r.SIGLA_UF}") for r in d_ehf.itertuples()]
                 or [html.Div("Nenhum município com os filtros atuais.", style={"color":"#6b7280"})])
     txt_ehf = f"{c_ehf} município(s) na categoria selecionada."
 
-    # ----- RISCO -----
     if "risk_class" in df.columns:
         d_risk = df[df["risk_class"] == risk_cls].sort_values(["SIGLA_UF","NM_MUN"])
         c_risk = len(d_risk["CD_MUN"].unique())
@@ -665,7 +680,6 @@ def cb_listas(idx_date, reg_key, uf_keys, ehf_cls, risk_cls):
 
     return txt_ehf, list_ehf, txt_risk, list_risk
 
-# ===== EXPORTAR XLSX (TODOS OS DIAS/TODOS MUNICÍPIOS) =====
 def _df_export_full():
     df = base.copy()
     if "Tmean" not in df or df["Tmean"].dropna().empty:
@@ -706,10 +720,7 @@ def exportar_ehf_full(n_clicks):
     if not n_clicks:
         return no_update
     out = _df_export_full()
-    if not DATES:
-        fname = "ehf_todas_datas.xlsx"
-    else:
-        fname = f"ehf_{DATES[0].isoformat()}_a_{DATES[-1].isoformat()}.xlsx"
+    fname = "ehf_todas_datas.xlsx" if not DATES else f"ehf_{DATES[0].isoformat()}_a_{DATES[-1].isoformat()}.xlsx"
     return dcc.send_data_frame(out.to_excel, fname, index=False)
 
 @callback(
@@ -721,17 +732,15 @@ def exportar_risco_full(n_clicks):
     if not n_clicks:
         return no_update
     out = _df_export_full()
-    if not DATES:
-        fname = "risco_todas_datas.xlsx"
-    else:
-        fname = f"risco_{DATES[0].isoformat()}_a_{DATES[-1].isoformat()}.xlsx"
+    fname = "risco_todas_datas.xlsx" if not DATES else f"risco_{DATES[0].isoformat()}_a_{DATES[-1].isoformat()}.xlsx"
     return dcc.send_data_frame(out.to_excel, fname, index=False)
 
 # ================== RUN ==================
 if __name__ == "__main__":
     import socket
 
-    PORT = 8069
+    # Render define PORT via env. Local continua 8069.
+    PORT = int(os.environ.get("PORT", "8069"))
     HOST = "0.0.0.0"
 
     def discover_ips():
@@ -768,3 +777,5 @@ if __name__ == "__main__":
         dev_tools_ui=False,
         dev_tools_props_check=False,
     )
+
+
