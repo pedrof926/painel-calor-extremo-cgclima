@@ -1,3 +1,4 @@
+import os
 import json
 from pathlib import Path
 import numpy as np
@@ -6,55 +7,37 @@ from dash import Dash, dcc, html, Input, Output, State, callback, no_update
 import plotly.express as px
 import math
 from datetime import date
-import os  # <-- NOVO (Render/PORT)
 
 # ----- Limites do Brasil (aprox.) + limites de zoom -----
 BRAZIL_BBOX = {"west": -74.5, "east": -32.0, "south": -34.5, "north": 6.0}
 CLAMP_ZOOM_MIN = 3.0
 CLAMP_ZOOM_MAX = 7.0
 
-# ================== CAMINHOS ==================
-# Ajuste p/ rodar local (Windows) e também no Render (caminhos relativos ao repo)
+# ================== CAMINHOS (Render-friendly) ==================
+# Em Render/GitHub: use caminhos relativos ao arquivo .py
 BASE_DIR = Path(__file__).resolve().parent
-PASTA_LOCAL = Path(r"C:\Users\Pedro\Downloads")
 
-def pick_first_existing(*candidates: Path) -> Path:
-    for p in candidates:
-        try:
-            if p.exists():
-                return p
-        except Exception:
-            pass
-    return candidates[0]
+# Se estiver rodando local e quiser manter seu padrão, você pode setar ENV LOCAL_DATA_DIR
+# Ex.: set LOCAL_DATA_DIR=C:\Users\Pedro\Downloads
+LOCAL_DATA_DIR = os.environ.get("LOCAL_DATA_DIR", "").strip()
+PASTA = Path(LOCAL_DATA_DIR) if LOCAL_DATA_DIR else BASE_DIR
 
-ARQ_PREV = pick_first_existing(
-    PASTA_LOCAL / "previsao_brasil_10dias.xlsx",
-    BASE_DIR / "previsao_brasil_10dias.xlsx",
-)
+ARQ_PREV = PASTA / "previsao_brasil_10dias.xlsx"
+ARQ_ATTR = PASTA / "arquivo_completo_brasil.xlsx"
 
-ARQ_ATTR = pick_first_existing(
-    PASTA_LOCAL / "arquivo_completo_brasil.xlsx",
-    BASE_DIR / "arquivo_completo_brasil.xlsx",
-)
-
-# Aceita .geojson OU .json (desde que o conteúdo seja GeoJSON válido)
-GEOJSON_MUN = pick_first_existing(
-    Path(r"C:\Users\Pedro\Downloads\Shapes_mun\municipios_br.geojson"),
-    Path(r"C:\Users\Pedro\Downloads\Shapes_mun\municipios_br.json"),
-    BASE_DIR / "municipios_br.geojson",
-    BASE_DIR / "municipios_br.json",
-)
+# Usar apenas o JSON (GeoJSON com extensão .json)
+GEOJSON_MUN = BASE_DIR / "municipios_br.json"  # coloque esse arquivo no mesmo diretório do .py (no repo)
 
 # ================== PALETAS & ORDENS ==================
 CLASS_ORDER = ["Normal", "Baixo", "Severo", "Extremo"]
-COLOR_MAP   = {
+COLOR_MAP = {
     "Normal": "#C5E0B4",
     "Baixo":  "#F1C40F",
     "Severo": "#E67E22",
     "Extremo":"#C0392B"
 }
 
-RISK_ORDER  = ["Normal", "Baixo", "Severo", "Extremo"]
+RISK_ORDER = ["Normal", "Baixo", "Severo", "Extremo"]
 RISK_COLORS = {
     "Normal": COLOR_MAP["Normal"],
     "Baixo":  COLOR_MAP["Baixo"],
@@ -88,18 +71,37 @@ def norm_key(x: pd.Series) -> pd.Series:
     return s
 
 def carregar_geojson_cdmun(path: Path):
+    # Lê GeoJSON (mesmo sendo .json) e:
+    # - garante properties.CD_MUN com 7 dígitos
+    # - remove features sem geometry (isso pode “sumir” o mapa no Plotly/Mapbox)
     with open(path, "r", encoding="utf-8") as f:
         gj = json.load(f)
+
     keys = ["CD_MUN","CD_GEOCMU","CD_GEOCODI","CD_MUNIC","CD_IBGE","GEOCODIGO","IBGE","id"]
+    feats_ok = []
+
     for ft in gj.get("features", []):
-        p = ft.get("properties", {})
+        if not ft.get("geometry"):
+            continue
+
+        p = ft.get("properties", {}) or {}
+
         cd = None
         for k in keys:
             if k in p and str(p[k]).strip():
-                cd = p[k]; break
+                cd = p[k]
+                break
+        if cd is None:
+            cd = ft.get("id")
+
         if cd is None:
             continue
+
         p["CD_MUN"] = "".join(ch for ch in str(cd) if ch.isdigit()).zfill(7)
+        ft["properties"] = p
+        feats_ok.append(ft)
+
+    gj["features"] = feats_ok
     return gj
 
 def lookup_nomes_from_geojson(gj):
@@ -107,7 +109,7 @@ def lookup_nomes_from_geojson(gj):
                  "NOME_MUN","NOME","name","Name","municipio","MUNICIPIO"]
     d = {}
     for ft in gj.get("features", []):
-        p = ft.get("properties", {})
+        p = ft.get("properties", {}) or {}
         cd = str(p.get("CD_MUN","")).zfill(7)
         nm = None
         for k in name_keys:
@@ -121,6 +123,7 @@ def lookup_nomes_from_geojson(gj):
 
 def calc_ehf(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["CD_MUN","data"]).reset_index(drop=True)
+
     if "Tmean" not in df or df["Tmean"].dropna().empty:
         if "Tmed" in df and not df["Tmed"].dropna().empty:
             df["Tmean"] = df["Tmed"]
@@ -145,12 +148,14 @@ def calc_ehf(df: pd.DataFrame) -> pd.DataFrame:
 
 def classify_by_ratio(df: pd.DataFrame) -> pd.DataFrame:
     df["ratio"] = np.where(df.get("EHF").gt(0) & df.get("EHF99").gt(0), df["EHF"]/df["EHF99"], np.nan)
+
     def _cls(r):
         if pd.isna(r["ratio"]) or r["EHF"] <= 0: return "Normal"
         if r["ratio"] >= 3:     return "Extremo"
         if r["ratio"] >= 1:     return "Severo"
         if r["ratio"] >= 0.85:  return "Baixo"
         return "Normal"
+
     df["classification"] = df.apply(_cls, axis=1)
     return df
 
@@ -158,11 +163,14 @@ def build_combined_risk(df: pd.DataFrame):
     if "GeoSES" not in df.columns:
         df["H_norm"]=np.nan; df["V"]=np.nan; df["risk_index"]=np.nan; df["risk_class"]="Normal"
         return df, False
+
     d = df.copy()
     geoses_num = pd.to_numeric(d["GeoSES"], errors="coerce")
-    d["V"] = ((1 - geoses_num) / 2).clip(0, 1)
+    d["V"] = ((1 - geoses_num) / 2).clip(0, 1)  # vulnerabilidade social (0=baixa,1=alta)
+
     H = (d["EHF"].clip(lower=0)) / d.get("EHF99").replace(0, np.nan)
     d["H_norm"] = H.clip(0, 1).fillna(0)
+
     d["risk_index"] = 0.5*d["H_norm"] + 0.5*d["V"]
 
     d["risk_class"] = pd.cut(
@@ -220,6 +228,11 @@ def bbox_to_center_zoom(bbox, width=1100, height=650, padding=0.06):
     return {"lat": lat_center, "lon": lon_center}, float(max(min(zoom, 10), 2.5))
 
 # ================== DADOS ==================
+if not ARQ_PREV.exists():
+    raise FileNotFoundError(f"Arquivo de previsão não encontrado: {ARQ_PREV}")
+if not ARQ_ATTR.exists():
+    raise FileNotFoundError(f"Arquivo de atributos não encontrado: {ARQ_ATTR}")
+
 prev = pd.read_excel(ARQ_PREV, engine="openpyxl")
 attr = pd.read_excel(ARQ_ATTR, engine="openpyxl")
 
@@ -234,9 +247,10 @@ attr = attr[[c for c in keep_attr if c in attr.columns]].drop_duplicates("CD_MUN
 
 base = prev.merge(attr, on="CD_MUN", how="left")
 
-# GeoJSON, nomes e derivação UF/Região
+# GeoJSON (json), nomes e derivação UF/Região
 if not GEOJSON_MUN.exists():
-    raise FileNotFoundError(f"GeoJSON de municípios não encontrado: {GEOJSON_MUN}")
+    raise FileNotFoundError(f"JSON/GeoJSON de municípios não encontrado: {GEOJSON_MUN}")
+
 GJ = carregar_geojson_cdmun(GEOJSON_MUN)
 NOME_MUN_LOOKUP = lookup_nomes_from_geojson(GJ)
 
@@ -265,6 +279,7 @@ base = calc_ehf(base)
 base = classify_by_ratio(base)
 base, HAS_RISK = build_combined_risk(base)
 
+# Default Brasília
 def busca_brasilia(df):
     c = df[(df["UF_KEY"]=="DF") & (df["NM_MUN"].str.upper().str.contains("BRASILIA|BRASÍLIA", na=False))]
     if not c.empty: return c.iloc[0]["CD_MUN"]
@@ -272,6 +287,7 @@ def busca_brasilia(df):
     return df["CD_MUN"].iloc[0]
 DEFAULT_MUN = busca_brasilia(base)
 
+# Opções dos filtros
 REG_OPTS = (base[["REG_KEY","NM_REGIAO"]].dropna().drop_duplicates()
             .sort_values("NM_REGIAO")
             .rename(columns={"REG_KEY":"value","NM_REGIAO":"label"})
@@ -293,128 +309,207 @@ def initial_date_index():
     return DATES.index(hoje) if hoje in DATES else 0
 
 # ================== APP ==================
-# Responsivo: viewport + meta_tags
-app = Dash(__name__, meta_tags=[{"name":"viewport","content":"width=device-width, initial-scale=1"}])
-server = app.server  # <-- necessário pro Render (gunicorn)
+app = Dash(__name__, meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1.0"}])
+server = app.server  # <- necessário pro gunicorn no Render
 app.title = "Fator de Excesso de Calor (EHF) – Brasil"
 
 layer_opts = [{"label":"EHF", "value":"ehf"}]
 if HAS_RISK:
     layer_opts.append({"label":"Risco combinado (EHF + GeoSES)", "value":"risk"})
 
+# ================== LAYOUT (Responsivo, sem mudar lógica) ==================
 app.layout = html.Div(
-    style={"fontFamily":"Inter, system-ui, Arial","padding":"12px","maxWidth":"1400px","margin":"0 auto"},
+    style={
+        "fontFamily":"Inter, system-ui, Arial",
+        "padding":"12px",
+        "maxWidth":"1400px",
+        "margin":"0 auto"
+    },
     children=[
-    html.H3("Fator de Excesso de Calor (EHF) – Brasil"),
-    html.Div([
-        html.Div([
-            html.Label("Data"),
-            dcc.Slider(
-                id="date-slider",
-                min=0, max=max(len(DATES)-1,0), step=1,
-                value=initial_date_index(),
-                marks={i: d.strftime("%d/%m") for i, d in enumerate(DATES)} if DATES else {}
-            )
-        ], style={"minWidth":"260px","flex":"2","marginRight":"8px"}),
+        html.H3("Fator de Excesso de Calor (EHF) – Brasil", style={"marginBottom":"8px"}),
 
-        html.Div([
-            html.Label("Região"),
-            dcc.Dropdown(id="regiao-filter", options=REG_OPTS, value=None, placeholder="Todas", clearable=True)
-        ], style={"minWidth":"200px","flex":"1","marginRight":"8px"}),
-
-        html.Div([
-            html.Label("UF"),
-            dcc.Dropdown(id="uf-filter", options=UF_OPTS_ALL, value=[], multi=True, placeholder="SIGLA_UF")
-        ], style={"minWidth":"220px","flex":"1","marginRight":"8px"}),
-
-        html.Div([
-            html.Label("Município"),
-            dcc.Dropdown(id="muni-filter", options=[], value=None, multi=False, placeholder="Município")
-        ], style={"minWidth":"300px","flex":"2","marginRight":"8px"}),
-
-        html.Div([
-            html.Label("Camada"),
-            dcc.RadioItems(id="layer", options=layer_opts, value=layer_opts[0]["value"], inline=True)
-        ], style={"minWidth":"260px","flex":"1"})
-    ], style={"display":"flex","gap":"10px","alignItems":"center","marginBottom":"10px","flexWrap":"wrap"}),
-
-    # Responsivo real: quebra 3/2 em telas menores (flexWrap + minWidth)
-    html.Div([
-        html.Div([
-            dcc.Graph(
-                id="mapa",
-                style={"height":"58vh","marginBottom":"8px"},
-                config={
-                    "scrollZoom": True,
-                    "displaylogo": False,
-                    "responsive": True,  # <-- responsivo (Plotly)
-                    "modeBarButtonsToRemove": ["pan2d","lasso2d","select2d","autoScale2d","toggleSpikelines"]
-                }
-            ),
-            html.Div(id="cards-ehf",
-                     style={"display":"grid","gridTemplateColumns":"repeat(4, 1fr)",
-                            "gap":"8px","alignItems":"stretch","marginTop":"2px"}),
-
-            html.Hr(),
-            html.Div("Consulta por classificação (dia atual)", style={"fontWeight":"700","margin":"6px 0"}),
-            html.Div([
+        # Barra de filtros (wrap)
+        html.Div(
+            [
                 html.Div([
-                    html.Div([
-                        html.Label("Classificação (EHF)"),
-                        dcc.Dropdown(
-                            id="ehf-cls-dd",
-                            options=[{"label":c,"value":c} for c in CLASS_ORDER],
-                            value=CLASS_ORDER[0],
-                            clearable=False
-                        )
-                    ], style={"marginBottom":"6px"}),
-                    html.Div(id="ehf-cls-count", style={"fontSize":"13px","marginBottom":"4px"}),
-                    html.Div(id="ehf-cls-list",
-                             style={"border":"1px solid #e5e7eb","borderRadius":"8px",
-                                    "padding":"8px","minHeight":"48px","maxHeight":"24vh","overflowY":"auto",
-                                    "backgroundColor":"#fff"}),
-
-                    html.Div([
-                        html.Button("Exportar XLSX (todos os dias)", id="btn-export-ehf", n_clicks=0),
-                        dcc.Download(id="dl-ehf"),
-                    ], style={"marginTop":"6px","display":"flex","justifyContent":"flex-end"}),
-                ], style={"flex":"1","minWidth":"280px","marginRight":"8px"}),
+                    html.Label("Data"),
+                    dcc.Slider(
+                        id="date-slider",
+                        min=0, max=max(len(DATES)-1,0), step=1,
+                        value=initial_date_index(),
+                        marks={i: d.strftime("%d/%m") for i, d in enumerate(DATES)} if DATES else {}
+                    )
+                ], style={"minWidth":"260px","flex":"2"}),
 
                 html.Div([
-                    html.Div([
-                        html.Label("Risco combinado"),
-                        dcc.Dropdown(
-                            id="risk-cls-dd",
-                            options=[{"label":c,"value":c} for c in RISK_ORDER],
-                            value=RISK_ORDER[0],
-                            clearable=False,
-                            disabled=(not HAS_RISK)
+                    html.Label("Região"),
+                    dcc.Dropdown(id="regiao-filter", options=REG_OPTS, value=None, placeholder="Todas", clearable=True)
+                ], style={"minWidth":"200px","flex":"1"}),
+
+                html.Div([
+                    html.Label("UF"),
+                    dcc.Dropdown(id="uf-filter", options=UF_OPTS_ALL, value=[], multi=True, placeholder="SIGLA_UF")
+                ], style={"minWidth":"220px","flex":"1"}),
+
+                html.Div([
+                    html.Label("Município"),
+                    dcc.Dropdown(id="muni-filter", options=[], value=None, multi=False, placeholder="Município")
+                ], style={"minWidth":"280px","flex":"2"}),
+
+                html.Div([
+                    html.Label("Camada"),
+                    dcc.RadioItems(id="layer", options=layer_opts, value=layer_opts[0]["value"], inline=True)
+                ], style={"minWidth":"260px","flex":"1"})
+            ],
+            style={
+                "display":"flex",
+                "gap":"10px",
+                "alignItems":"center",
+                "marginBottom":"10px",
+                "flexWrap":"wrap"
+            }
+        ),
+
+        # Grid responsiva (2 colunas no desktop, 1 no mobile)
+        html.Div(
+            [
+                # ====== COL ESQUERDA ======
+                html.Div(
+                    [
+                        dcc.Graph(
+                            id="mapa",
+                            style={"height":"58vh","marginBottom":"8px"},
+                            config={
+                                "scrollZoom": True,
+                                "displaylogo": False,
+                                "modeBarButtonsToRemove": ["pan2d","lasso2d","select2d","autoScale2d","toggleSpikelines"]
+                            }
+                        ),
+                        html.Div(
+                            id="cards-ehf",
+                            style={
+                                "display":"grid",
+                                "gridTemplateColumns":"repeat(auto-fit, minmax(170px, 1fr))",
+                                "gap":"8px",
+                                "alignItems":"stretch",
+                                "marginTop":"2px"
+                            }
+                        ),
+
+                        html.Hr(),
+                        html.Div("Consulta por classificação (dia atual)", style={"fontWeight":"700","margin":"6px 0"}),
+
+                        html.Div(
+                            [
+                                # EHF
+                                html.Div(
+                                    [
+                                        html.Div([
+                                            html.Label("Classificação (EHF)"),
+                                            dcc.Dropdown(
+                                                id="ehf-cls-dd",
+                                                options=[{"label":c,"value":c} for c in CLASS_ORDER],
+                                                value=CLASS_ORDER[0],
+                                                clearable=False
+                                            )
+                                        ], style={"marginBottom":"6px"}),
+
+                                        html.Div(id="ehf-cls-count", style={"fontSize":"13px","marginBottom":"4px"}),
+
+                                        html.Div(
+                                            id="ehf-cls-list",
+                                            style={
+                                                "border":"1px solid #e5e7eb",
+                                                "borderRadius":"8px",
+                                                "padding":"8px",
+                                                "minHeight":"48px",
+                                                "maxHeight":"24vh",
+                                                "overflowY":"auto",
+                                                "backgroundColor":"#fff"
+                                            }
+                                        ),
+
+                                        html.Div(
+                                            [
+                                                html.Button("Exportar XLSX (todos os dias)", id="btn-export-ehf", n_clicks=0),
+                                                dcc.Download(id="dl-ehf"),
+                                            ],
+                                            style={"marginTop":"6px","display":"flex","justifyContent":"flex-end"}
+                                        ),
+                                    ],
+                                    style={"flex":"1","minWidth":"280px"}
+                                ),
+
+                                # RISCO
+                                html.Div(
+                                    [
+                                        html.Div([
+                                            html.Label("Risco combinado"),
+                                            dcc.Dropdown(
+                                                id="risk-cls-dd",
+                                                options=[{"label":c,"value":c} for c in RISK_ORDER],
+                                                value=RISK_ORDER[0],
+                                                clearable=False,
+                                                disabled=(not HAS_RISK)
+                                            )
+                                        ], style={"marginBottom":"6px"}),
+
+                                        html.Div(id="risk-cls-count", style={"fontSize":"13px","marginBottom":"4px"}),
+
+                                        html.Div(
+                                            id="risk-cls-list",
+                                            style={
+                                                "border":"1px solid #e5e7eb",
+                                                "borderRadius":"8px",
+                                                "padding":"8px",
+                                                "minHeight":"48px",
+                                                "maxHeight":"24vh",
+                                                "overflowY":"auto",
+                                                "backgroundColor":"#fff"
+                                            }
+                                        ),
+
+                                        html.Div(
+                                            [
+                                                html.Button("Exportar XLSX (todos os dias)", id="btn-export-risk", n_clicks=0, disabled=(not HAS_RISK)),
+                                                dcc.Download(id="dl-risk"),
+                                            ],
+                                            style={"marginTop":"6px","display":"flex","justifyContent":"flex-end"}
+                                        ),
+                                    ],
+                                    style={"flex":"1","minWidth":"280px"}
+                                )
+                            ],
+                            style={"display":"flex","gap":"8px","flexWrap":"wrap"}
                         )
-                    ], style={"marginBottom":"6px"}),
-                    html.Div(id="risk-cls-count", style={"fontSize":"13px","marginBottom":"4px"}),
-                    html.Div(id="risk-cls-list",
-                             style={"border":"1px solid #e5e7eb","borderRadius":"8px",
-                                    "padding":"8px","minHeight":"48px","maxHeight":"24vh","overflowY":"auto",
-                                    "backgroundColor":"#fff"}),
+                    ],
+                    style={"minWidth":"320px"}
+                ),
 
-                    html.Div([
-                        html.Button("Exportar XLSX (todos os dias)", id="btn-export-risk", n_clicks=0, disabled=(not HAS_RISK)),
-                        dcc.Download(id="dl-risk"),
-                    ], style={"marginTop":"6px","display":"flex","justifyContent":"flex-end"}),
-                ], style={"flex":"1","minWidth":"280px"})
-            ], style={"display":"flex","gap":"8px","flexWrap":"wrap"})
-        ], style={"flex":"3","minWidth":"320px","paddingRight":"8px"}),
-
-        html.Div([
-            dcc.Graph(
-                id="serie-municipio",
-                style={"height":"50vh","marginBottom":"10px"},
-                config={"responsive": True, "displaylogo": False}
-            ),
-            html.Div(id="ehf-dia", style={"display":"grid","gridTemplateColumns":"repeat(5, 1fr)","gap":"6px"})
-        ], style={"flex":"2","minWidth":"320px","paddingLeft":"8px"})
-    ], style={"display":"flex","gap":"8px","flexWrap":"wrap"})
-])
+                # ====== COL DIREITA ======
+                html.Div(
+                    [
+                        dcc.Graph(id="serie-municipio", style={"height":"50vh","marginBottom":"10px"}),
+                        html.Div(
+                            id="ehf-dia",
+                            style={
+                                "display":"grid",
+                                "gridTemplateColumns":"repeat(auto-fit, minmax(140px, 1fr))",
+                                "gap":"6px"
+                            }
+                        )
+                    ],
+                    style={"minWidth":"320px"}
+                )
+            ],
+            style={
+                "display":"grid",
+                "gridTemplateColumns":"repeat(auto-fit, minmax(420px, 1fr))",
+                "gap":"12px"
+            }
+        )
+    ]
+)
 
 # ================== CALLBACKS ==================
 @callback(
@@ -459,10 +554,7 @@ def cb_munis(reg_key, uf_keys, clickData, mval):
         if clicked not in valid:
             clicked = None
 
-    if clicked:
-        val = clicked
-    else:
-        val = mval if (mval in valid) else None
+    val = clicked if clicked else (mval if (mval in valid) else None)
     return ops, val
 
 @callback(
@@ -480,9 +572,11 @@ def cb_munis(reg_key, uf_keys, clickData, mval):
 def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
     if not DATES:
         return px.scatter(), px.bar(), [], []
+
     dia = DATES[idx_date] if 0 <= idx_date < len(DATES) else DATES[-1]
     uf_keys = uf_keys or []
 
+    # ====== MAPA ======
     df = base[base["data"].dt.date == dia].copy()
     if reg_key:
         df = df[df["REG_KEY"] == reg_key]
@@ -523,6 +617,7 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
         zoom=3.4,
         opacity=0.85
     )
+
     fig_map.update_traces(
         marker_line_width=0.2, marker_line_color="#000000",
         hovertemplate="<b>%{hovertext}</b><br>" +
@@ -532,8 +627,8 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
     )
     fig_map.update_layout(clickmode="event+select")
 
+    # Auto-zoom quando aplicar filtro geográfico (clamp ao Brasil)
     apply_zoom = bool(reg_key) or bool(uf_keys) or bool(muni_key)
-    bbox = None
     if apply_zoom and not vis.empty:
         target_cds = [muni_key] if filter_muni_active else vis["CD_MUN"].astype(str).unique().tolist()
         bbox = _union_bbox([BBOX_BY_MUN.get(cd) for cd in target_cds])
@@ -544,6 +639,7 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
             lon = min(max(center["lon"], BRAZIL_BBOX["west"]),  BRAZIL_BBOX["east"])
             fig_map.update_layout(mapbox_center={"lat": lat, "lon": lon}, mapbox_zoom=z)
 
+    # Clamp após interações do usuário (relayoutData)
     if isinstance(relayout, dict):
         c = relayout.get("mapbox.center") or relayout.get("mapbox._center")
         z = relayout.get("mapbox.zoom")
@@ -561,12 +657,16 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
             z = max(min(float(z), CLAMP_ZOOM_MAX), CLAMP_ZOOM_MIN)
             fig_map.update_layout(mapbox_center={"lat": lat, "lon": lon}, mapbox_zoom=z)
 
-    fig_map.update_layout(margin={"r":0,"t":0,"l":0,"b":0},
-                          legend_title_text=legend_title,
-                          uirevision=f"reg:{reg_key}|ufs:{','.join(uf_keys)}|mun:{muni_key or ''}")
+    fig_map.update_layout(
+        margin={"r":0,"t":0,"l":0,"b":0},
+        legend_title_text=legend_title,
+        uirevision=f"reg:{reg_key}|ufs:{','.join(uf_keys)}|mun:{muni_key or ''}"
+    )
 
+    # ====== BARRAS MUNICÍPIO ======
     muni_sel = muni_key if muni_key else DEFAULT_MUN
     dmun = base[base["CD_MUN"] == muni_sel].copy()
+
     if "Tmean" not in dmun or dmun["Tmean"].dropna().empty:
         if "Tmed" in dmun and not dmun["Tmed"].dropna().empty:
             dmun["Tmean"] = dmun["Tmed"]
@@ -579,12 +679,17 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
              .dropna(subset=["data"]).sort_values("data"))
 
     MES = {1:"JAN",2:"FEV",3:"MAR",4:"ABR",5:"MAI",6:"JUN",7:"JUL",8:"AGO",9:"SET",10:"OUT",11:"NOV",12:"DEZ"}
-    serie["data_lbl"] = serie["data"].dt.day.astype(str).str.zfill(2) + " " + serie["data"].dt.month.map(MES)
-
-    bt = serie.melt(id_vars=["data","data_lbl","NM_MUN","SIGLA_UF"], value_vars=["Tmin","Tmean","Tmax"],
-                    var_name="Série", value_name="Valor")
-    bt["Série"] = bt["Série"].map({"Tmin":"Tmín","Tmean":"Tméd","Tmax":"Tmáx"})
-    titulo = f"Previsão – {serie.iloc[0]['NM_MUN']} / {serie.iloc[0]['SIGLA_UF']}" if not serie.empty else "Previsão"
+    if not serie.empty:
+        serie["data_lbl"] = serie["data"].dt.day.astype(str).str.zfill(2) + " " + serie["data"].dt.month.map(MES)
+        bt = serie.melt(id_vars=["data","data_lbl","NM_MUN","SIGLA_UF"], value_vars=["Tmin","Tmean","Tmax"],
+                        var_name="Série", value_name="Valor")
+        bt["Série"] = bt["Série"].map({"Tmin":"Tmín","Tmean":"Tméd","Tmax":"Tmáx"})
+        titulo = f"Previsão – {serie.iloc[0]['NM_MUN']} / {serie.iloc[0]['SIGLA_UF']}"
+        cat_array = serie["data_lbl"].tolist()
+    else:
+        bt = pd.DataFrame({"data_lbl":[], "Valor":[], "Série":[]})
+        titulo = "Previsão"
+        cat_array = []
 
     fig_bar = px.bar(bt, x="data_lbl", y="Valor", color="Série",
                      color_discrete_map=BARS_COLORS, barmode="group", title=titulo)
@@ -592,7 +697,7 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
 
     fig_bar.update_xaxes(
         categoryorder="array",
-        categoryarray=serie["data_lbl"].tolist(),
+        categoryarray=cat_array,
         showgrid=False,
         fixedrange=True
     )
@@ -608,36 +713,47 @@ def cb_viz(idx_date, reg_key, uf_keys, muni_key, layer, relayout):
         paper_bgcolor="white"
     )
 
+    # ====== CARDS ======
     cont = df[color_col].value_counts().reindex(ordem, fill_value=0)
     cards = []
     for lbl in ordem:
         val = int(cont.get(lbl, 0))
         pal = (RISK_COLORS if layer=="risk" and HAS_RISK else COLOR_MAP).get(lbl, "#6b7280")
         cards.append(
-            html.Div([
-                html.Div(lbl, style={"fontWeight":"600","fontSize":"13px","marginBottom":"4px","textAlign":"center"}),
-                html.Div(f"{val:,}".replace(",","."), style={"fontSize":"20px","fontWeight":"800","textAlign":"center"})
-            ], style={
-                "backgroundColor":"#FFF","border":"1px solid #e5e7eb","borderLeft":"8px solid "+pal,
-                "borderRadius":"10px","padding":"10px","height":"78px","display":"flex",
-                "flexDirection":"column","justifyContent":"center"
-            })
+            html.Div(
+                [
+                    html.Div(lbl, style={"fontWeight":"600","fontSize":"13px","marginBottom":"4px","textAlign":"center"}),
+                    html.Div(f"{val:,}".replace(",","."), style={"fontSize":"20px","fontWeight":"800","textAlign":"center"})
+                ],
+                style={
+                    "backgroundColor":"#FFF","border":"1px solid #e5e7eb","borderLeft":"8px solid "+pal,
+                    "borderRadius":"10px","padding":"10px","height":"78px","display":"flex",
+                    "flexDirection":"column","justifyContent":"center"
+                }
+            )
         )
 
+    # ====== EHF POR DIA (município) ======
     ehf_boxes = []
     if not serie.empty:
         for dstr, cl in zip(serie["data_lbl"], serie["classification"]):
             cor = COLOR_MAP.get(cl, "#6b7280")
             ehf_boxes.append(
-                html.Div([
-                    html.Div(dstr, style={"fontWeight":"600","marginBottom":"2px"}),
-                    html.Div(cl,   style={"fontSize":"14px","fontWeight":"700"})
-                ], style={"backgroundColor":"#FFF","border":"1px solid #e5e7eb",
-                          "borderLeft":"10px solid "+cor,"borderRadius":"10px","padding":"8px"})
+                html.Div(
+                    [
+                        html.Div(dstr, style={"fontWeight":"600","marginBottom":"2px"}),
+                        html.Div(cl,   style={"fontSize":"14px","fontWeight":"700"})
+                    ],
+                    style={
+                        "backgroundColor":"#FFF","border":"1px solid #e5e7eb",
+                        "borderLeft":"10px solid "+cor,"borderRadius":"10px","padding":"8px"
+                    }
+                )
             )
 
     return fig_map, fig_bar, cards, ehf_boxes
 
+# ===== CONSULTA POR CLASSE (listas) =====
 @callback(
     Output("ehf-cls-count","children"),
     Output("ehf-cls-list","children"),
@@ -653,6 +769,7 @@ def cb_listas(idx_date, reg_key, uf_keys, ehf_cls, risk_cls):
     if not DATES:
         msg = html.Div("Nenhum município com os filtros atuais.", style={"color":"#6b7280"})
         return "", msg, "", msg
+
     dia = DATES[idx_date] if 0 <= idx_date < len(DATES) else DATES[-1]
     uf_keys = uf_keys or []
 
@@ -680,6 +797,7 @@ def cb_listas(idx_date, reg_key, uf_keys, ehf_cls, risk_cls):
 
     return txt_ehf, list_ehf, txt_risk, list_risk
 
+# ===== EXPORTAR XLSX (TODOS OS DIAS/TODOS MUNICÍPIOS) =====
 def _df_export_full():
     df = base.copy()
     if "Tmean" not in df or df["Tmean"].dropna().empty:
@@ -705,6 +823,7 @@ def _df_export_full():
         "Tmin": "Tmínima",
         "Tmean": "Tmédia",
     }
+
     out = (df[list(cols.keys())]
            .rename(columns=cols)
            .sort_values(["Data","UF","NM_MUN"]))
@@ -735,47 +854,17 @@ def exportar_risco_full(n_clicks):
     fname = "risco_todas_datas.xlsx" if not DATES else f"risco_{DATES[0].isoformat()}_a_{DATES[-1].isoformat()}.xlsx"
     return dcc.send_data_frame(out.to_excel, fname, index=False)
 
-# ================== RUN ==================
+# ================== RUN (Render-friendly) ==================
 if __name__ == "__main__":
-    import socket
-
-    # Render define PORT via env. Local continua 8069.
     PORT = int(os.environ.get("PORT", "8069"))
-    HOST = "0.0.0.0"
-
-    def discover_ips():
-        ips = set()
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ips.add(s.getsockname()[0]); s.close()
-        except Exception:
-            pass
-        try:
-            hostname = socket.gethostname()
-            for ip in socket.gethostbyname_ex(hostname)[2]:
-                if not ip.startswith("127."):
-                    ips.add(ip)
-        except Exception:
-            pass
-        return sorted(ips)
-
-    links = [f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"]
-    for ip in discover_ips():
-        links.append(f"http://{ip}:{PORT}")
-    links = list(dict.fromkeys(links))
-
-    print("\n>>> Acesse o painel pelos links abaixo:")
-    for url in links:
-        print("   -", url)
-    print("")
-
     app.run(
-        host=HOST,
+        host="0.0.0.0",
         port=PORT,
         debug=False,
         dev_tools_ui=False,
         dev_tools_props_check=False,
     )
+
+
 
 
